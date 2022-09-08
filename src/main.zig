@@ -331,6 +331,30 @@ const Header = struct {
     }
 };
 
+const OffsetTable = struct {
+    table: []const u64,
+
+    fn read(allocator: std.mem.Allocator, header: Header, reader: std.fs.File.Reader) !OffsetTable {
+        const data_height = header.data_window.y_max - header.data_window.y_min;
+        if (data_height < 0) return error.InvalidImage;
+        const table_size = @intCast(u32, data_height) / header.compression.scanLinesPerBlock();
+
+        var table = try allocator.alloc(u64, table_size);
+
+        for (table) |*entry| {
+            entry.* = try reader.readIntLittle(u64);
+        }
+
+        return OffsetTable {
+            .table = table,
+        };
+    }
+
+    fn destroy(self: *OffsetTable, allocator: std.mem.Allocator) void {
+        allocator.free(self.table);
+    }
+};
+
 const Error = error {
     BadMagicNumber,
     Unimplemented,
@@ -345,6 +369,7 @@ pub const Image = struct {
     magic: i32,
     version: Version,
     header: Header,
+    offset_table: OffsetTable,
 
     pub fn fromFile(allocator: std.mem.Allocator, file: std.fs.File) !Image {
         const reader = file.reader();
@@ -362,15 +387,20 @@ pub const Image = struct {
         // component three
         const header = try Header.read(allocator, reader);
 
+        // component four
+        const offset_table = try OffsetTable.read(allocator, header, reader);
+
         return Image {
             .magic = magic,
             .version = version,
             .header = header,
+            .offset_table = offset_table,
         };
     }
 
     pub fn destroy(self: *Image, allocator: std.mem.Allocator) void {
         self.header.destroy(allocator);
+        self.offset_table.destroy(allocator);
     }
 };
 

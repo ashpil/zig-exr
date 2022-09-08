@@ -18,15 +18,15 @@ const ChannelList = struct {
 
     channels: []Channel,
 
-    fn read(allocator: std.mem.Allocator, bytes: []const u8) !ChannelList {
+    fn read(allocator: std.mem.Allocator, bytes: []const u8) Error!ChannelList {
         var channels = std.ArrayList(Channel).init(allocator);
 
         const reader = std.io.fixedBufferStream(bytes).reader();
         while (true) {
-            const name = try reader.readUntilDelimiterAlloc(allocator, 0, 256);
+            const name = reader.readUntilDelimiterAlloc(allocator, 0, 256) catch return Error.OutOfMemory; // don't think we can get bad file here since reading from string? not sure
             if (name.len == 0) break;
 
-            const buffer = try reader.readBytesNoEof(@sizeOf(Channel) - @sizeOf([]u8));
+            const buffer = reader.readBytesNoEof(@sizeOf(Channel) - @sizeOf([]u8)) catch return Error.BadFile;
 
             try channels.append(.{
                 .name = name,
@@ -79,11 +79,11 @@ const Compression = enum(u8) {
 const String = struct {
     slice: []const u8,
 
-    fn read(allocator: std.mem.Allocator, bytes: []const u8) !String {
+    fn read(allocator: std.mem.Allocator, bytes: []const u8) Error!String {
         const reader = std.io.fixedBufferStream(bytes).reader();
-        const len = try reader.readIntLittle(i32);
+        const len = reader.readIntLittle(i32) catch return Error.BadFile;
 
-        const slice = try allocator.alloc(u8, @intCast(usize, len));
+        const slice = allocator.alloc(u8, @intCast(usize, len)) catch return Error.OutOfMemory;
 
         std.mem.copy(u8, slice, bytes);
 
@@ -164,7 +164,7 @@ const Header = struct {
         ty: AttributeType,
         value: *anyopaque,
 
-        fn create(ty: AttributeType, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader, size: i32) !Attribute {
+        fn create(ty: AttributeType, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader, size: i32) Error!Attribute {
             return switch (ty) {
                 .chlist => try Attribute.createInner(ChannelList, allocator, name, reader, size),
                 .string => try Attribute.createInner(String, allocator, name, reader, size),
@@ -176,7 +176,7 @@ const Header = struct {
             };
         }
 
-        fn createInner(comptime T: type, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader, size: i32) !Attribute {
+        fn createInner(comptime T: type, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader, size: i32) Error!Attribute {
             var value = try allocator.create(T);
             value.* = try createInnerInner(T, allocator, reader, size);
             return Attribute {
@@ -186,16 +186,16 @@ const Header = struct {
             };
         }
 
-        fn createInnerInner(comptime T: type, allocator: std.mem.Allocator, reader: std.fs.File.Reader, size: i32) !T {
+        fn createInnerInner(comptime T: type, allocator: std.mem.Allocator, reader: std.fs.File.Reader, size: i32) Error!T {
             return switch (@typeInfo(T)) {
-                .Enum => try reader.readEnum(T, std.builtin.Endian.Little),
+                .Enum => reader.readEnum(T, std.builtin.Endian.Little) catch return Error.BadFile,
                 .Struct => if (@hasDecl(T, "read")) blk: {
-                    const bytes = try allocator.alloc(u8, @intCast(usize, size));
+                    const bytes = allocator.alloc(u8, @intCast(usize, size)) catch return Error.OutOfMemory;
                     defer allocator.free(bytes);
-                    try reader.readNoEof(bytes);
+                    reader.readNoEof(bytes) catch return Error.BadFile;
                     break :blk try T.read(allocator, bytes);
-                } else @bitCast(T, try reader.readBytesNoEof(@sizeOf(T))),
-                else => @bitCast(T, try reader.readBytesNoEof(@sizeOf(T))),
+                } else @bitCast(T, reader.readBytesNoEof(@sizeOf(T)) catch return Error.BadFile),
+                else => @bitCast(T, reader.readBytesNoEof(@sizeOf(T)) catch return Error.BadFile),
             };
         }
 
@@ -252,7 +252,7 @@ const Header = struct {
 
     misc_attributes: Attributes,
 
-    pub fn read(allocator: std.mem.Allocator, reader: std.fs.File.Reader) !Header {
+    pub fn read(allocator: std.mem.Allocator, reader: std.fs.File.Reader) Error!Header {
         var self: Header = undefined;
         self.misc_attributes = Attributes {};
 
@@ -261,17 +261,17 @@ const Header = struct {
         while (true) {
             const attr_name = blk: {
                 var buf: [32:0]u8 = undefined;
-                const name = try reader.readUntilDelimiter(&buf, 0);
+                const name = reader.readUntilDelimiter(&buf, 0) catch return Error.BadFile;
                 break :blk name;
             };
             if (attr_name.len == 0) break;
 
             const attr_type = blk: {
                 var buf: [32:0]u8 = undefined;
-                const ty = try reader.readUntilDelimiter(&buf, 0);
+                const ty = reader.readUntilDelimiter(&buf, 0) catch return Error.BadFile;
                 break :blk AttributeType.fromString(ty);
             };
-            const size = try reader.readIntLittle(i32);
+            const size = reader.readIntLittle(i32) catch return Error.BadFile;
 
             //std.debug.print("{s}: {any}\n", .{ attr_name, attr_type });
             if (std.mem.eql(u8, attr_name, "channels")) {
@@ -314,7 +314,7 @@ const Header = struct {
 
         if (!found_attributes.foundAll()) {
             //std.log.warn("{any}\n", .{ found_attributes });
-            return error.MissingAttributes;
+            return Error.MissingAttributes;
         }
 
         return self;
@@ -334,15 +334,15 @@ const Header = struct {
 const OffsetTable = struct {
     table: []const u64,
 
-    fn read(allocator: std.mem.Allocator, header: Header, reader: std.fs.File.Reader) !OffsetTable {
+    fn read(allocator: std.mem.Allocator, header: Header, reader: std.fs.File.Reader) Error!OffsetTable {
         const data_height = header.data_window.y_max - header.data_window.y_min;
-        if (data_height < 1) return error.InvalidImage;
+        if (data_height < 1) return Error.BadDimensions;
         const table_size = (@intCast(u32, data_height) - 1) / header.compression.scanLinesPerBlock() + 1;
 
-        var table = try allocator.alloc(u64, table_size);
+        var table = allocator.alloc(u64, table_size) catch return Error.OutOfMemory;
 
         for (table) |*entry| {
-            entry.* = try reader.readIntLittle(u64);
+            entry.* = reader.readIntLittle(u64) catch return Error.BadFile;
         }
 
         return OffsetTable {
@@ -363,14 +363,14 @@ const PixelData = struct {
 
     blocks: []ScanLineBlock,
 
-    fn read(allocator: std.mem.Allocator, offset_table: OffsetTable, reader: std.fs.File.Reader) !PixelData {
+    fn read(allocator: std.mem.Allocator, offset_table: OffsetTable, reader: std.fs.File.Reader) Error!PixelData {
         var blocks = try allocator.alloc(ScanLineBlock, offset_table.table.len);
 
         for (blocks) |*block| {
-            block.y_coordinate = try reader.readIntLittle(i32);
-            const pixel_data_len = try reader.readIntLittle(i32);
-            block.pixel_data = try allocator.alloc(u8, @intCast(usize, pixel_data_len));
-            try reader.readNoEof(block.pixel_data);
+            block.y_coordinate = reader.readIntLittle(i32) catch return Error.BadFile;
+            const pixel_data_len = reader.readIntLittle(i32) catch return Error.BadFile;
+            block.pixel_data = allocator.alloc(u8, @intCast(usize, pixel_data_len)) catch return Error.OutOfMemory;
+            reader.readNoEof(block.pixel_data) catch return Error.BadFile;
         }
 
         return PixelData {
@@ -387,7 +387,11 @@ const PixelData = struct {
 };
 
 const Error = error {
+    BadFile,
     BadMagicNumber,
+    BadDimensions,
+    MissingAttributes,
+    OutOfMemory,
     Unimplemented,
 };
 
@@ -403,10 +407,10 @@ pub const Image = struct {
     offset_table: OffsetTable,
     pixel_data: PixelData,
 
-    pub fn fromFile(allocator: std.mem.Allocator, file: std.fs.File) !Image {
+    pub fn fromFile(allocator: std.mem.Allocator, file: std.fs.File) Error!Image {
         const reader = file.reader();
 
-        const buffer = try reader.readBytesNoEof(@sizeOf(i32) + @sizeOf(Version));
+        const buffer = reader.readBytesNoEof(@sizeOf(i32) + @sizeOf(Version)) catch return Error.BadFile;
 
         // component one
         const magic = @bitCast(i32, buffer[0..@sizeOf(i32)].*);

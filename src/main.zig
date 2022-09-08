@@ -61,6 +61,19 @@ const Compression = enum(u8) {
     pxr24 = 5,
     b44 = 6,
     b44a = 7,
+
+    fn scanLinesPerBlock(self: Compression) u8 {
+        return switch (self) {
+            .no => 1,
+            .rle => 1,
+            .zips => 1,
+            .zip => 16,
+            .piz => 32,
+            .pxr24 => 16,
+            .b44 => 32,
+            .b44a => 32,
+        };
+    }
 };
 
 const String = struct {
@@ -151,23 +164,30 @@ const Header = struct {
         ty: AttributeType,
         value: *anyopaque,
 
-        fn create(ty: AttributeType, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader) !Attribute {
+        fn create(ty: AttributeType, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader, size: i32) !Attribute {
             return switch (ty) {
-                .chlist => try Attribute.createInner(ChannelList, allocator, name, reader),
-                .string => try Attribute.createInner(String, allocator, name, reader),
-                .compression => try Attribute.createInner(Compression, allocator, name, reader),
-                .box2i => try Attribute.createInner(Box2i, allocator, name, reader),
-                .line_order => try Attribute.createInner(LineOrder, allocator, name, reader),
-                .float => try Attribute.createInner(f32, allocator, name, reader),
-                .v2f => try Attribute.createInner(V2f, allocator, name, reader),
+                .chlist => try Attribute.createInner(ChannelList, allocator, name, reader, size),
+                .string => try Attribute.createInner(String, allocator, name, reader, size),
+                .compression => try Attribute.createInner(Compression, allocator, name, reader, size),
+                .box2i => try Attribute.createInner(Box2i, allocator, name, reader, size),
+                .line_order => try Attribute.createInner(LineOrder, allocator, name, reader, size),
+                .float => try Attribute.createInner(f32, allocator, name, reader, size),
+                .v2f => try Attribute.createInner(V2f, allocator, name, reader, size),
             };
         }
 
-        fn createInner(comptime T: type, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader) !Attribute {
-            const size = try reader.readIntLittle(i32);
-
+        fn createInner(comptime T: type, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader, size: i32) !Attribute {
             var value = try allocator.create(T);
-            value.* = switch (@typeInfo(T)) {
+            value.* = try createInnerInner(T, allocator, reader, size);
+            return Attribute {
+                .name = name,
+                .ty = comptime AttributeType.fromType(T),
+                .value = value,
+            };
+        }
+
+        fn createInnerInner(comptime T: type, allocator: std.mem.Allocator, reader: std.fs.File.Reader, size: i32) !T {
+            return switch (@typeInfo(T)) {
                 .Enum => try reader.readEnum(T, std.builtin.Endian.Little),
                 .Struct => if (@hasDecl(T, "read")) blk: {
                     const bytes = try allocator.alloc(u8, @intCast(usize, size));
@@ -176,12 +196,6 @@ const Header = struct {
                     break :blk try T.read(allocator, bytes);
                 } else @bitCast(T, try reader.readBytesNoEof(@sizeOf(T))),
                 else => @bitCast(T, try reader.readBytesNoEof(@sizeOf(T))),
-            };
-
-            return Attribute {
-                .name = name,
-                .ty = comptime AttributeType.fromType(T),
-                .value = value,
             };
         }
 
@@ -210,36 +224,110 @@ const Header = struct {
 
     const Attributes = std.MultiArrayList(Attribute);
 
-    attributes: Attributes,
+    const FoundAttributes = struct {
+        channels: bool = false,
+        compression: bool = false,
+        data_window: bool = false,
+        display_window: bool = false,
+        line_order: bool = false,
+        pixel_aspect_ratio: bool = false,
+        screen_window_center: bool = false,
+        screen_window_width: bool = false,
+
+        fn foundAll(self: FoundAttributes) bool {
+            return self.channels and self.compression and self.data_window
+                and self.display_window and self.line_order and self.pixel_aspect_ratio
+                and self.screen_window_center and self.screen_window_width;
+        }
+    };
+
+    channels: ChannelList,
+    compression: Compression,
+    data_window: Box2i,
+    display_window: Box2i,
+    line_order: LineOrder,
+    pixel_aspect_ratio: f32,
+    screen_window_center: V2f,
+    screen_window_width: f32,
+
+    misc_attributes: Attributes,
 
     pub fn read(allocator: std.mem.Allocator, reader: std.fs.File.Reader) !Header {
-        var attributes = Attributes {};
+        var self: Header = undefined;
+        self.misc_attributes = Attributes {};
+
+        var found_attributes = FoundAttributes {};
 
         while (true) {
-            const attr_name = try reader.readUntilDelimiterAlloc(allocator, 0, 32);
+            const attr_name = blk: {
+                var buf: [32:0]u8 = undefined;
+                const name = try reader.readUntilDelimiter(&buf, 0);
+                break :blk name;
+            };
             if (attr_name.len == 0) break;
 
             const attr_type = blk: {
-                var ty_buf: [32:0]u8 = undefined;
-                const ty_read = try reader.readUntilDelimiter(&ty_buf, 0);
-                break :blk AttributeType.fromString(ty_read);
+                var buf: [32:0]u8 = undefined;
+                const ty = try reader.readUntilDelimiter(&buf, 0);
+                break :blk AttributeType.fromString(ty);
             };
-            //std.debug.print("{s}: {any}\n", .{ attr_name, attr_type });
+            const size = try reader.readIntLittle(i32);
 
-            try attributes.append(allocator, try Attribute.create(attr_type, allocator, attr_name, reader));
+            //std.debug.print("{s}: {any}\n", .{ attr_name, attr_type });
+            if (std.mem.eql(u8, attr_name, "channels")) {
+                self.channels = try Attribute.createInnerInner(ChannelList, allocator, reader, size);
+                std.debug.assert(!found_attributes.channels);
+                found_attributes.channels = true;
+            } else if (std.mem.eql(u8, attr_name, "compression")) {
+                self.compression = try Attribute.createInnerInner(Compression, allocator, reader, size);
+                std.debug.assert(!found_attributes.compression);
+                found_attributes.compression = true;
+            } else if (std.mem.eql(u8, attr_name, "dataWindow")) {
+                self.data_window = try Attribute.createInnerInner(Box2i, allocator, reader, size);
+                std.debug.assert(!found_attributes.data_window);
+                found_attributes.data_window = true;
+            } else if (std.mem.eql(u8, attr_name, "displayWindow")) {
+                self.display_window = try Attribute.createInnerInner(Box2i, allocator, reader, size);
+                std.debug.assert(!found_attributes.display_window);
+                found_attributes.display_window = true;
+            } else if (std.mem.eql(u8, attr_name, "lineOrder")) {
+                self.line_order = try Attribute.createInnerInner(LineOrder, allocator, reader, size);
+                std.debug.assert(!found_attributes.line_order);
+                found_attributes.line_order = true;
+            } else if (std.mem.eql(u8, attr_name, "pixelAspectRatio")) {
+                self.pixel_aspect_ratio = try Attribute.createInnerInner(f32, allocator, reader, size);
+                std.debug.assert(!found_attributes.pixel_aspect_ratio);
+                found_attributes.pixel_aspect_ratio = true;
+            } else if (std.mem.eql(u8, attr_name, "screenWindowCenter")) {
+                self.screen_window_center = try Attribute.createInnerInner(V2f, allocator, reader, size);
+                std.debug.assert(!found_attributes.screen_window_center);
+                found_attributes.screen_window_center = true;
+            } else if (std.mem.eql(u8, attr_name, "screenWindowWidth")) {
+                self.screen_window_width = try Attribute.createInnerInner(f32, allocator, reader, size);
+                std.debug.assert(!found_attributes.screen_window_width);
+                found_attributes.screen_window_width = true;
+            } else {
+                const name = try allocator.dupe(u8, attr_name);
+                try self.misc_attributes.append(allocator, try Attribute.create(attr_type, allocator, name, reader, size));
+            }
         }
 
-        return Header {
-            .attributes = attributes,
-        };
+        if (!found_attributes.foundAll()) {
+            //std.log.warn("{any}\n", .{ found_attributes });
+            return error.MissingAttributes;
+        }
+
+        return self;
     }
 
     fn destroy(self: *Header, allocator: std.mem.Allocator) void {
-        while (self.attributes.popOrNull()) |*attr| {
+        self.channels.destroy(allocator);
+
+        while (self.misc_attributes.popOrNull()) |*attr| {
             attr.destroy(allocator);
         }
 
-        self.attributes.deinit(allocator);
+        self.misc_attributes.deinit(allocator);
     }
 };
 
@@ -263,13 +351,16 @@ pub const Image = struct {
 
         const buffer = try reader.readBytesNoEof(@sizeOf(i32) + @sizeOf(Version));
 
+        // component one
         const magic = @bitCast(i32, buffer[0..@sizeOf(i32)].*);
         if (magic != 20000630) return Error.BadMagicNumber;
 
+        // component two
         const version = @bitCast(Version, buffer[@sizeOf(i32)..buffer.len].*);
         if (version.flags != 0) return Error.Unimplemented; // don't support any other for now
 
-        var header = try Header.read(allocator, reader);
+        // component three
+        const header = try Header.read(allocator, reader);
 
         return Image {
             .magic = magic,

@@ -1,0 +1,293 @@
+const std = @import("std");
+
+const ChannelList = struct {
+    const Channel = struct {
+        const PixelType = enum(i32) {
+            uint = 0,
+            half = 1,
+            float = 2,
+        };
+
+        name: []u8,
+        pixel_type: PixelType,
+        p_linear: u8,
+        reserved: [3]u8,
+        x_sampling: i32,
+        y_sampling: i32,
+    };
+
+    channels: []Channel,
+
+    fn read(allocator: std.mem.Allocator, bytes: []const u8) !ChannelList {
+        var channels = std.ArrayList(Channel).init(allocator);
+
+        const reader = std.io.fixedBufferStream(bytes).reader();
+        while (true) {
+            const name = try reader.readUntilDelimiterAlloc(allocator, 0, 256);
+            if (name.len == 0) break;
+
+            const buffer = try reader.readBytesNoEof(@sizeOf(Channel) - @sizeOf([]u8));
+
+            try channels.append(.{
+                .name = name,
+                .pixel_type = @intToEnum(Channel.PixelType, @bitCast(i32, buffer[0..@sizeOf(i32)].*)),
+                .p_linear = buffer[@sizeOf(i32)],
+                .reserved = buffer[@sizeOf(i32) + @sizeOf(u8)..][0..@sizeOf([3]u8)].*,
+                .x_sampling = @bitCast(i32, buffer[@sizeOf(i32) + @sizeOf(u8) + @sizeOf([3]u8)..][0..@sizeOf(i32)].*),
+                .y_sampling = @bitCast(i32, buffer[@sizeOf(i32) + @sizeOf(u8) + @sizeOf([3]u8) + @sizeOf(i32)..][0..@sizeOf(i32)].*),
+            });
+        }
+
+        return ChannelList {
+            .channels = channels.toOwnedSlice(),
+        };
+    }
+
+    fn destroy(self: *ChannelList, allocator: std.mem.Allocator) void {
+        for (self.channels) |channel| {
+            allocator.free(channel.name);
+        }
+
+        allocator.free(self.channels);
+    }
+};
+
+const Compression = enum(u8) {
+    no = 0,
+    rle = 1,
+    zips = 2,
+    zip = 3,
+    piz = 4,
+    pxr24 = 5,
+    b44 = 6,
+    b44a = 7,
+};
+
+const String = struct {
+    slice: []const u8,
+
+    fn read(allocator: std.mem.Allocator, bytes: []const u8) !String {
+        const reader = std.io.fixedBufferStream(bytes).reader();
+        const len = try reader.readIntLittle(i32);
+
+        const slice = try allocator.alloc(u8, @intCast(usize, len));
+
+        std.mem.copy(u8, slice, bytes);
+
+        return String {
+            .slice = slice,
+        };
+    }
+
+    fn destroy(self: *String, allocator: std.mem.Allocator) void {
+        allocator.free(self.slice);
+    }
+};
+
+const Box2i = packed struct {
+    x_min: i32,
+    y_min: i32,
+    x_max: i32,
+    y_max: i32,
+};
+
+const LineOrder = enum(u8) {
+    increasing_y,
+    decreasing_y,
+    random_y,
+};
+
+const V2f = packed struct {
+    x: f32,
+    y: f32,
+};
+
+const Header = struct {
+    const AttributeType = enum {
+        chlist,
+        string,
+        compression,
+        box2i,
+        line_order,
+        float,
+        v2f,
+
+        fn fromString(ty: []const u8) AttributeType {
+            if (std.mem.eql(u8, ty, "chlist")) {
+                return .chlist;
+            } else if (std.mem.eql(u8, ty, "string")) {
+                return .string;
+            } else if (std.mem.eql(u8, ty, "compression")) {
+                return .compression;
+            } else if (std.mem.eql(u8, ty, "box2i")) {
+                return .box2i;
+            } else if (std.mem.eql(u8, ty, "lineOrder")) {
+                return .line_order;
+            } else if (std.mem.eql(u8, ty, "float")) {
+                return .float;
+            } else if (std.mem.eql(u8, ty, "v2f")) {
+                return .v2f;
+            } else {
+                unreachable; // TODO
+            }
+        }
+
+        fn fromType(comptime T: type) AttributeType {
+            return switch (T) {
+                ChannelList => .chlist,
+                String => .string,
+                Compression => .compression,
+                Box2i => .box2i,
+                LineOrder => .line_order,
+                f32 => .float,
+                V2f => .v2f,
+                else => @compileError("Unsupported type for attribute type"),
+            };
+        }
+    };
+
+    const Attribute = struct {
+        name: []const u8,
+        ty: AttributeType,
+        value: *anyopaque,
+
+        fn create(ty: AttributeType, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader) !Attribute {
+            return switch (ty) {
+                .chlist => try Attribute.createInner(ChannelList, allocator, name, reader),
+                .string => try Attribute.createInner(String, allocator, name, reader),
+                .compression => try Attribute.createInner(Compression, allocator, name, reader),
+                .box2i => try Attribute.createInner(Box2i, allocator, name, reader),
+                .line_order => try Attribute.createInner(LineOrder, allocator, name, reader),
+                .float => try Attribute.createInner(f32, allocator, name, reader),
+                .v2f => try Attribute.createInner(V2f, allocator, name, reader),
+            };
+        }
+
+        fn createInner(comptime T: type, allocator: std.mem.Allocator, name: []const u8, reader: std.fs.File.Reader) !Attribute {
+            const size = try reader.readIntLittle(i32);
+
+            var value = try allocator.create(T);
+            value.* = switch (@typeInfo(T)) {
+                .Enum => try reader.readEnum(T, std.builtin.Endian.Little),
+                .Struct => if (@hasDecl(T, "read")) blk: {
+                    const bytes = try allocator.alloc(u8, @intCast(usize, size));
+                    defer allocator.free(bytes);
+                    try reader.readNoEof(bytes);
+                    break :blk try T.read(allocator, bytes);
+                } else @bitCast(T, try reader.readBytesNoEof(@sizeOf(T))),
+                else => @bitCast(T, try reader.readBytesNoEof(@sizeOf(T))),
+            };
+
+            return Attribute {
+                .name = name,
+                .ty = comptime AttributeType.fromType(T),
+                .value = value,
+            };
+        }
+
+        fn destroy(self: *Attribute, allocator: std.mem.Allocator) void {
+            switch (self.ty) {
+                .chlist => self.destroyInner(ChannelList, allocator),
+                .string => self.destroyInner(String, allocator),
+                .compression => self.destroyInner(Compression, allocator),
+                .box2i => self.destroyInner(Box2i, allocator),
+                .line_order => self.destroyInner(LineOrder, allocator),
+                .float => self.destroyInner(f32, allocator),
+                .v2f => self.destroyInner(V2f, allocator),
+            }
+        }
+
+        fn destroyInner(self: *Attribute, comptime T: type, allocator: std.mem.Allocator) void {
+            allocator.free(self.name);
+
+            const val = @ptrCast(*T, @alignCast(@alignOf(T), self.value));
+            if (@typeInfo(T) == .Struct and @hasDecl(T, "destroy")) {
+                val.destroy(allocator);
+            }
+            allocator.destroy(val);
+        }
+    };
+
+    const Attributes = std.MultiArrayList(Attribute);
+
+    attributes: Attributes,
+
+    pub fn read(allocator: std.mem.Allocator, reader: std.fs.File.Reader) !Header {
+        var attributes = Attributes {};
+
+        while (true) {
+            const attr_name = try reader.readUntilDelimiterAlloc(allocator, 0, 32);
+            if (attr_name.len == 0) break;
+
+            const attr_type = blk: {
+                var ty_buf: [32:0]u8 = undefined;
+                const ty_read = try reader.readUntilDelimiter(&ty_buf, 0);
+                break :blk AttributeType.fromString(ty_read);
+            };
+            //std.debug.print("{s}: {any}\n", .{ attr_name, attr_type });
+
+            try attributes.append(allocator, try Attribute.create(attr_type, allocator, attr_name, reader));
+        }
+
+        return Header {
+            .attributes = attributes,
+        };
+    }
+
+    fn destroy(self: *Header, allocator: std.mem.Allocator) void {
+        while (self.attributes.popOrNull()) |*attr| {
+            attr.destroy(allocator);
+        }
+
+        self.attributes.deinit(allocator);
+    }
+};
+
+const Error = error {
+    BadMagicNumber,
+    Unimplemented,
+};
+
+pub const Image = struct {
+    const Version = packed struct {
+        version: u8,
+        flags: u24,
+    };
+
+    magic: i32,
+    version: Version,
+    header: Header,
+
+    pub fn fromFile(allocator: std.mem.Allocator, file: std.fs.File) !Image {
+        const reader = file.reader();
+
+        const buffer = try reader.readBytesNoEof(@sizeOf(i32) + @sizeOf(Version));
+
+        const magic = @bitCast(i32, buffer[0..@sizeOf(i32)].*);
+        if (magic != 20000630) return Error.BadMagicNumber;
+
+        const version = @bitCast(Version, buffer[@sizeOf(i32)..buffer.len].*);
+        if (version.flags != 0) return Error.Unimplemented; // don't support any other for now
+
+        var header = try Header.read(allocator, reader);
+
+        return Image {
+            .magic = magic,
+            .version = version,
+            .header = header,
+        };
+    }
+
+    pub fn destroy(self: *Image, allocator: std.mem.Allocator) void {
+        self.header.destroy(allocator);
+    }
+};
+
+test "basic" {
+    const file = try std.fs.cwd().openFile("test.exr", .{});
+    defer file.close();
+
+    var image = try Image.fromFile(std.testing.allocator, file);
+    defer image.destroy(std.testing.allocator);
+}
+

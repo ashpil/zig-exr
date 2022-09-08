@@ -336,8 +336,8 @@ const OffsetTable = struct {
 
     fn read(allocator: std.mem.Allocator, header: Header, reader: std.fs.File.Reader) !OffsetTable {
         const data_height = header.data_window.y_max - header.data_window.y_min;
-        if (data_height < 0) return error.InvalidImage;
-        const table_size = @intCast(u32, data_height) / header.compression.scanLinesPerBlock();
+        if (data_height < 1) return error.InvalidImage;
+        const table_size = (@intCast(u32, data_height) - 1) / header.compression.scanLinesPerBlock() + 1;
 
         var table = try allocator.alloc(u64, table_size);
 
@@ -352,6 +352,37 @@ const OffsetTable = struct {
 
     fn destroy(self: *OffsetTable, allocator: std.mem.Allocator) void {
         allocator.free(self.table);
+    }
+};
+
+const PixelData = struct {
+    const ScanLineBlock = struct {
+        y_coordinate: i32,
+        pixel_data: []u8,
+    };
+
+    blocks: []ScanLineBlock,
+
+    fn read(allocator: std.mem.Allocator, offset_table: OffsetTable, reader: std.fs.File.Reader) !PixelData {
+        var blocks = try allocator.alloc(ScanLineBlock, offset_table.table.len);
+
+        for (blocks) |*block| {
+            block.y_coordinate = try reader.readIntLittle(i32);
+            const pixel_data_len = try reader.readIntLittle(i32);
+            block.pixel_data = try allocator.alloc(u8, @intCast(usize, pixel_data_len));
+            try reader.readNoEof(block.pixel_data);
+        }
+
+        return PixelData {
+            .blocks = blocks,
+        };
+    }
+
+    fn destroy(self: *PixelData, allocator: std.mem.Allocator) void {
+        for (self.blocks) |block| {
+            allocator.free(block.pixel_data);
+        }
+        allocator.free(self.blocks);
     }
 };
 
@@ -370,6 +401,7 @@ pub const Image = struct {
     version: Version,
     header: Header,
     offset_table: OffsetTable,
+    pixel_data: PixelData,
 
     pub fn fromFile(allocator: std.mem.Allocator, file: std.fs.File) !Image {
         const reader = file.reader();
@@ -390,17 +422,22 @@ pub const Image = struct {
         // component four
         const offset_table = try OffsetTable.read(allocator, header, reader);
 
+        // component five
+        const pixel_data = try PixelData.read(allocator, offset_table, reader);
+
         return Image {
             .magic = magic,
             .version = version,
             .header = header,
             .offset_table = offset_table,
+            .pixel_data = pixel_data,
         };
     }
 
     pub fn destroy(self: *Image, allocator: std.mem.Allocator) void {
         self.header.destroy(allocator);
         self.offset_table.destroy(allocator);
+        self.pixel_data.destroy(allocator);
     }
 };
 
@@ -409,6 +446,7 @@ test "basic" {
     defer file.close();
 
     var image = try Image.fromFile(std.testing.allocator, file);
+    //std.debug.print("{any}", .{ image });
     defer image.destroy(std.testing.allocator);
 }
 
